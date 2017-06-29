@@ -2,6 +2,8 @@
 
 Simple SPA build with [Elm](http://elm-lang.org/) on a [Serverless](https://serverless.com/) architecture to monitor [AWS SES](http://docs.aws.amazon.com/ses/latest/DeveloperGuide/notifications.html) Suppression List
 
+Architecture diagram ![Architecture diagram](https://raw.github.com/altcatalin/ses-monitor/master/architecture_diagram.png)
+
 ## Prerequisites
 
 * [AWS account](https://aws.amazon.com/)
