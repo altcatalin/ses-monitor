@@ -1,0 +1,382 @@
+custom:
+  prefix: ""
+
+service: ${self:custom.prefix}Ses-Monitor
+
+provider:
+  name: aws
+  stage: production
+  region: eu-west-1
+  runtime: nodejs6.10
+  versionFunctions: false
+
+plugins:
+  - serverless-plugin-aws-service-name-compliance
+
+package:
+  individually: true
+  exclude:
+    - ./**
+
+functions:
+  ConsumerFunction:
+    handler: src/consumer/index.handler
+    name: ${self:service}-Consumer-${self:provider.stage}
+    description: SES Monitor Consumer
+    memorySize: 128
+    timeout: 60
+    role: ConsumerRole
+    environment:
+      QUEUE_URL:
+        Ref: Queue
+      TABLE_NAME:
+        Ref: SuppressionTable
+    package:
+      include:
+        - src/consumer/**
+    events:
+      -
+        schedule:
+          name: ${self:service}-Consumer-${self:provider.stage}
+          rate: cron(* * * * ? *)
+          enabled: false
+
+resources:  # CloudFormation template syntax
+  Resources:
+
+    # DynamoDb
+    SuppressionTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:service}-Suppression-${self:provider.stage}
+        AttributeDefinitions:
+          -
+            AttributeName: r # mail.commonHeaders.To
+            AttributeType: S
+          -
+            AttributeName: t # mail.timestamp
+            AttributeType: S
+          -
+            AttributeName: s # constant
+            AttributeType: N
+        KeySchema:
+          -
+            AttributeName: r
+            KeyType: HASH
+        ProvisionedThroughput:
+          ReadCapacityUnits: 10
+          WriteCapacityUnits: 10
+        GlobalSecondaryIndexes:
+          -
+            IndexName: timestamp
+            KeySchema:
+              -
+                AttributeName: s
+                KeyType: HASH
+              -
+                AttributeName: t
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+            ProvisionedThroughput:
+              ReadCapacityUnits: 10
+              WriteCapacityUnits: 10
+
+    # SQS
+    Queue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${self:provider.stage}
+        RedrivePolicy:
+          deadLetterTargetArn:
+            Fn::GetAtt:
+              - DeadLetterQueue
+              - Arn
+          maxReceiveCount: 3
+
+    DeadLetterQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-DeadLetter-${self:provider.stage}
+
+    QueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        PolicyDocument:
+          Id: ${self:service}-QueuePolicy-${self:provider.stage}
+          Statement:
+            -
+              Sid: Allow-SendMessage-From-SNS-Topic
+              Effect: Allow
+              Principal: "*"
+              Action:
+                - sqs:SendMessage
+              Resource: "*"
+              Condition:
+                ArnEquals:
+                  aws:SourceArn:
+                    Ref: Topic
+        Queues:
+          - Ref: Queue
+
+    # SNS
+    Topic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:service}-${self:provider.stage}
+        Subscription:
+          -
+            Endpoint:
+              Fn::GetAtt:
+                - Queue
+                - Arn
+            Protocol: sqs
+
+    # S3
+    Bucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:service}-${self:provider.stage}
+        AccessControl: PublicRead
+        WebsiteConfiguration:
+          IndexDocument: index.html
+          ErrorDocument: index.html
+
+    BucketPolicy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+        Bucket:
+          Ref: Bucket
+        PolicyDocument:
+          Statement:
+            - Sid: Public-Read-Get-Object
+              Effect: Allow
+              Principal: "*"
+              Action:
+              - s3:GetObject
+              Resource:
+                Fn::Join:
+                  - ""
+                  -
+                    - "arn:aws:s3:::"
+                    - Ref: Bucket
+                    - "/*"
+
+    # CloudFront
+    CloudFront:
+      Type: AWS::CloudFront::Distribution
+      Properties:
+        DistributionConfig:
+          Origins:
+            -
+              DomainName:
+                Fn::Select:
+                  - 1
+                  -
+                    Fn::Split:
+                      - "://"
+                      -
+                        Fn::GetAtt:
+                          - Bucket
+                          - WebsiteURL
+              Id:
+                Ref: Bucket
+              CustomOriginConfig:
+                HTTPPort: 80
+                HTTPSPort: 443
+                OriginProtocolPolicy: http-only
+          Enabled: true
+          ## Uncomment the following section in case you are using a custom domain
+          # Aliases:
+          # - mysite.example.com
+          DefaultRootObject: index.html
+          DefaultCacheBehavior:
+            TargetOriginId:
+              Ref: Bucket
+            ViewerProtocolPolicy: redirect-to-https
+            ForwardedValues:
+              QueryString: false
+              Cookies:
+                Forward: none
+          ViewerCertificate:
+            CloudFrontDefaultCertificate: true
+
+    # Cognito
+    UserPool:
+      Type: AWS::Cognito::UserPool
+      Properties:
+        UserPoolName: ${self:service}-${self:provider.stage}
+        AdminCreateUserConfig:
+          AllowAdminCreateUserOnly: false
+
+    UserPoolClient:
+      Type: AWS::Cognito::UserPoolClient
+      Properties:
+        ClientName: ${self:service}-${self:provider.stage}
+        ExplicitAuthFlows:
+          - ADMIN_NO_SRP_AUTH
+        GenerateSecret: false
+        UserPoolId:
+          Ref: UserPool
+
+    IdentityPool:
+      Type: AWS::Cognito::IdentityPool
+      Properties:
+        IdentityPoolName: ${self:service}-${self:provider.stage}
+        AllowUnauthenticatedIdentities: false
+        CognitoIdentityProviders:
+          -
+            ClientId:
+              Ref: UserPoolClient
+            ProviderName:
+              Fn::GetAtt:
+                - UserPool
+                - ProviderName
+
+    IdentityPoolRoleAttachment:
+      Type: AWS::Cognito::IdentityPoolRoleAttachment
+      Properties:
+        IdentityPoolId:
+          Ref: IdentityPool
+        Roles:
+          authenticated:
+            Fn::GetAtt:
+              - IdentityPoolAuthRole
+              - Arn
+
+    # IAM
+    ConsumerRole:
+      Type: AWS::IAM::Role
+      Properties:
+        Path: /
+        RoleName: ${self:service}-Consumer-${self:provider.stage}
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            -
+              Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          -
+            PolicyName: ${self:service}-Consumer-${self:provider.stage}
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                -
+                  Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource:
+                    Fn::Join:
+                      - ":"
+                      -
+                        - "arn:aws:logs"
+                        - Ref: "AWS::Region"
+                        - Ref: "AWS::AccountId"
+                        - "log-group:/aws/lambda/*:*:*"
+                -
+                  Effect: Allow
+                  Action:
+                    - sqs:ReceiveMessage
+                    - sqs:DeleteMessage
+                  Resource:
+                    Fn::GetAtt:
+                      - Queue
+                      - Arn
+                -
+                  Effect: Allow
+                  Action:
+                    - dynamodb:PutItem
+                  Resource:
+                    Fn::Join:
+                      - ":"
+                      -
+                        - "arn:aws:dynamodb"
+                        - Ref: "AWS::Region"
+                        - Ref: "AWS::AccountId"
+                        - Fn::Join:
+                          - ""
+                          -
+                            - "table/"
+                            - Ref: SuppressionTable
+    IdentityPoolAuthRole:
+      Type: AWS::IAM::Role
+      Properties:
+        Path: /
+        RoleName: ${self:service}-IdentityPoolAuth-${self:provider.stage}
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            -
+              Effect: Allow
+              Principal:
+                Federated:
+                  - cognito-identity.amazonaws.com
+              Action: sts:AssumeRoleWithWebIdentity
+        Policies:
+          -
+            PolicyName: ${self:service}-IdentityPoolAuth-${self:provider.stage}
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                -
+                  Effect: Allow
+                  Action:
+                    - mobileanalytics:PutEvents
+                    - cognito-sync:*
+                    - execute-api:*
+                  Resource: "*"
+                -
+                  Effect: Allow
+                  Action:
+                    - dynamodb:GetItem
+                    - dynamodb:Query
+                    - dynamodb:Scan
+                  Resource:
+                    Fn::Join:
+                      - ":"
+                      -
+                        - "arn:aws:dynamodb"
+                        - Ref: "AWS::Region"
+                        - Ref: "AWS::AccountId"
+                        - Fn::Join:
+                          - ""
+                          -
+                            - "table/"
+                            - Ref: SuppressionTable
+                            - "/*"
+
+  # Output
+  Outputs:
+    Region:
+      Value: ${self:provider.region}
+    CognitoPoolId:
+      Value:
+        Ref: UserPool
+    CognitoPoolClientId:
+      Value:
+        Ref: UserPoolClient
+    CognitoIdentityPoolId:
+      Value:
+        Ref: IdentityPool
+    DynamoDBSuppressionTable:
+      Value:
+        Ref: SuppressionTable
+    CloudFrontDomain:
+      Value:
+        Fn::GetAtt:
+          - CloudFront
+          - DomainName
+    S3Bucket:
+      Value:
+        Ref: Bucket
+    SNSTopic:
+      Value:
+        Fn::GetAtt:
+          - Topic
+          - TopicName
